@@ -12,29 +12,22 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// SECURITY: the Mongo URI now comes from .env — never hardcode credentials in code.
+// Mongo URI comes from .env (never hardcode credentials in code).
 const uri = process.env.MONGODB_URI;
 if (!uri) {
-  console.error("Missing MONGODB_URI in .env — copy .env.example to .env and fill it in.");
+  console.error("Missing MONGODB_URI in .env. Copy .env.example to .env and fill it in.");
   process.exit(1);
 }
 const client = new MongoClient(uri);
 
 // ---------- Auth (JWT) ----------
-// SECURITY: previously there was no session/token layer at all — every
-// route just trusted whatever email/role showed up in the request body,
-// and the admin routes had no gate whatsoever. This adds a real token
-// layer: signup/login issue a JWT, and requireAuth/requireAdmin verify it.
-//
-// NOTE — this pass covers the admin routes (the ones flagged as unsafe to
-// ship) end to end: they now hard-require a valid admin token. It does
-// NOT yet migrate every rider/driver route off trusting req.body.email —
-// that's a much bigger refactor touching most endpoints in this file, and
-// isn't safe to do in the same pass without a way to test each one live.
-// Treat that as the next hardening step, not something silently skipped.
+// signup/login issue a JWT; requireAuth/requireAdmin verify it on protected
+// routes. Note: admin routes fully require a valid admin token, but most
+// rider/driver routes still trust req.body.email directly. Migrating
+// those to token auth too is the next hardening step.
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
-  console.error("Missing JWT_SECRET in .env — copy .env.example to .env and fill it in.");
+  console.error("Missing JWT_SECRET in .env. Copy .env.example to .env and fill it in.");
   process.exit(1);
 }
 const JWT_EXPIRY = "30d";
@@ -72,16 +65,11 @@ function requireAdmin(req, res, next) {
 
 const VALID_CATEGORIES = ["economy", "comfort", "xl", "green"];
 
-// ---------- Fare formula — SINGLE SOURCE OF TRUTH ----------
-// This used to be hand-duplicated in mobile/src/utils/fare.js: change one
-// number here, remember to change the matching number over there, or the
-// two silently drift apart. That's fixed now — this backend is the only
-// place these numbers live. The mobile app fetches them from
-// GET /api/config/fare once at startup (see fetchFareConfig in
-// mobile/src/context/AuthContext.js) and only falls back to its own
-// bundled defaults if that fetch fails (e.g. fully offline first launch).
-// To change pricing: edit the values below and redeploy the backend —
-// nothing on the mobile side needs to change or be rebuilt.
+// ---------- Fare formula. Single source of truth ----------
+// The mobile app fetches these from GET /api/config/fare at startup (see
+// fetchFareConfig in AuthContext.js) and only falls back to its own bundled
+// defaults if that fetch fails. To change pricing: edit the values below
+// and redeploy (nothing on the mobile side needs to change).
 const FUEL_PRICE_PER_LITER = 1500;
 const AVERAGE_KM_PER_LITER = 10;
 const MARKUP_MULTIPLIER = 2.5;
@@ -107,14 +95,10 @@ function calculateFareForCategory(distanceKm, categoryId) {
 }
 
 // ---------- Locked-price matching queue ----------
-// The rider still picks a specific driver up front (browse-and-pick stays
-// the UX) — what changes is what happens when that driver doesn't answer.
-// Instead of the ride just dying, the backend builds a fallback queue of
-// the next-nearest same-category online drivers at request time and walks
-// through it automatically on decline OR on timeout. The price is locked
-// the moment estimatedFare is first stored below; escalating through the
-// queue only ever swaps WHO is being asked, never re-quotes what they're
-// asked to accept.
+// If the picked driver doesn't answer, the backend builds a fallback queue
+// of next-nearest same-category drivers and walks through it on decline or
+// timeout. The fare is locked once estimatedFare is first stored, escalating
+// through the queue only ever changes who's asked, never re-quotes the price.
 const MATCH_RESPONSE_TIMEOUT_MS = 20 * 1000; // 20s to accept/decline before auto-escalating
 const MATCH_QUEUE_MAX_CANDIDATES = 5; // cap how many drivers get pinged per ride
 
@@ -125,7 +109,7 @@ async function buildMatchQueue(category, excludeDriverId, pickupLocation) {
   const withDistance = candidates.map((d) => ({
     driverId: d._id,
     name: d.name,
-    // Missing coords (either side) sort last, not excluded — a driver
+    // Missing coords (either side) sort last, not excluded. A driver
     // shouldn't lose their spot in the queue just because location
     // tracking hasn't reported in yet.
     distanceMeters: pickupLocation && d.location ? distanceMetersBetween(pickupLocation, d.location) : null,
@@ -140,7 +124,7 @@ async function buildMatchQueue(category, excludeDriverId, pickupLocation) {
 }
 
 // Shared by the decline endpoint, the lazy timeout resolver, and the
-// "driver went offline mid-match" hook — one place that knows how to move
+// "driver went offline mid-match" hook. One place that knows how to move
 // a ride to its next candidate (or give up) so all three stay consistent.
 async function advanceMatchQueue(ride, outcome) {
   const now = new Date();
@@ -165,7 +149,7 @@ async function advanceMatchQueue(ride, outcome) {
   return { ...ride, ...update };
 }
 
-// Lazy — no job scheduler in this stack, so a stalled match is only
+// Lazy. No job scheduler in this stack, so a stalled match is only
 // noticed (and escalated) the next time the ride is read, same pattern as
 // resolveExpiredDestinationChange below. Cheap: it's just a timestamp
 // comparison unless the timeout has actually elapsed.
@@ -178,22 +162,19 @@ async function resolveStalledMatch(ride) {
 }
 
 // ---------- Route deviation protection ----------
-// At trip start we ask Google Routes for the "optimal" route between
-// pickup and destination and store its distance. At trip completion we
-// compare that to what the driver's GPS actually logged. A trip is only
-// flagged if it blows past BOTH a percentage tolerance and a minimum-km
-// floor — the floor exists so a 2km trip that comes in at 2.3km (nothing
-// but GPS drift and a couple of extra turns) never gets flagged just
-// because 20% of a small number is an even smaller one.
+// Compares Google Routes' "optimal" distance (fetched at trip start) to
+// what the driver's GPS actually logged. A trip is only flagged past both
+// a percentage tolerance and a minimum-km floor, so a short trip with a
+// couple extra turns doesn't get flagged over a fraction of a km.
 const ROUTE_DEVIATION_TOLERANCE_PERCENT = 0.20; // 20% over the optimal route's distance
 const ROUTE_DEVIATION_MIN_SLACK_KM = 1; // always allow at least 1km of slack
 // Routes API is a sibling of Places API (New) on the same Google Cloud
-// project — reuses GOOGLE_PLACES_API_KEY by default as long as "Routes
+// project (reuses GOOGLE_PLACES_API_KEY by default as long as "Routes)
 // API" is also enabled for it in Cloud Console; set GOOGLE_ROUTES_API_KEY
 // separately only if you want a dedicated key/quota for it.
 const ROUTES_KEY = process.env.GOOGLE_ROUTES_API_KEY || process.env.GOOGLE_PLACES_API_KEY;
 
-// Never throws — missing key, missing coords, a bad API response, a
+// Never throws. Missing key, missing coords, a bad API response, a
 // network error all just resolve to null. A routing hiccup must never be
 // able to block a trip from starting; "no optimal route on file" simply
 // means no deviation protection for that one trip, same as today.
@@ -253,34 +234,25 @@ function applyRouteDeviationProtection(ride, submittedDistanceKm, submittedFare,
 }
 
 // ---------- Safety-first defaults ----------
-// Three real, working pieces: an SOS button, an off-app-trip detector, and
-// trip sharing. Emergency contacts live with the other profile routes
-// further down. There's no push/SMS infrastructure in this stack, so
-// "alerting someone" here means: land immediately in the admin's SLA-
-// tracked support queue at "urgent" priority (reusing the ticket system
-// built for #5) rather than inventing a second notification channel.
+// An SOS button, an off-app-trip detector, and trip sharing. Emergency
+// contacts live with the other profile routes further down. There's no
+// push/SMS infrastructure here, so "alerting someone" means landing
+// immediately in the admin's SLA-tracked support queue at "urgent"
+// priority rather than a separate notification channel.
 const OFF_APP_WARNING_MS = 3 * 60 * 1000;   // 3 min of driver-location silence -> soft in-app warning
 const OFF_APP_INCIDENT_MS = 15 * 60 * 1000; // 15 min of silence -> auto safety incident + urgent ticket
 const SOS_POST_TRIP_WINDOW_MS = 15 * 60 * 1000; // SOS still works up to 15 min after drop-off
 const MAX_EMERGENCY_CONTACTS = 3;
 
 // ---------- Transparent driver pay: logged-in/available time ----------
-// The existing driver summary already showed exactly what a completed trip
-// paid — this fills the real gap: Spring had NO record of a driver's
-// online-but-not-on-a-trip time at all, so there was nothing to pay it
-// from even if you wanted to. This adds that record (driverOnlineSessions)
-// and a rate to pay it at.
+// Tracks a driver's online-but-not-on-a-trip time (driverOnlineSessions)
+// and pays it at a guaranteed-minimum rate: a driver's day is never worth
+// less than online hours × ONLINE_TIME_PAY_PER_HOUR_NAIRA; trip earnings
+// only top up when they fall short of that floor (see /api/driver/:id/summary).
 //
-// ⚠️ BUSINESS DECISION, NOT AN ENGINEERING ONE: ONLINE_TIME_PAY_PER_HOUR_NAIRA
-// below is a placeholder so this feature is functional out of the box —
-// it is NOT a researched or approved number. Set it to whatever Spring
-// actually wants to guarantee per hour online (or 0, which effectively
-// disables the payout while keeping the transparency — online hours would
-// still show on the summary either way). The payout itself now uses the
-// guaranteed-minimum model ("whichever is higher" — see /api/driver/:id/summary):
-// a driver's day is never worth less than online hours × this rate; trip
-// earnings only get topped up when they fall short of that floor, never a
-// flat add-on on top of a day that already cleared it.
+// ONLINE_TIME_PAY_PER_HOUR_NAIRA below is a placeholder, not a researched
+// or approved number (set it to whatever rate is actually decided (or 0)
+// to disable the payout while keeping the online-hours transparency).
 const ONLINE_TIME_PAY_PER_HOUR_NAIRA = 300;
 
 // Sums how many minutes a driver was online within [since, now], clipping
@@ -336,7 +308,7 @@ async function logSafetyIncident({ ride, type, triggeredBy, location, note }) {
     }
   }
 
-  const priority = "urgent"; // safety always forces urgent — see CATEGORY_FORCED_PRIORITY
+  const priority = "urgent"; // safety always forces urgent (see CATEGORY_FORCED_PRIORITY)
   const { firstResponseDueAt, resolutionDueAt } = slaDeadlines(priority, now);
   const description = note || (type === "sos"
     ? "Rider/driver triggered the SOS button mid-trip."
@@ -361,7 +333,7 @@ async function logSafetyIncident({ ride, type, triggeredBy, location, note }) {
     safetyIncidentId: incidentResult.insertedId,
   };
   const ticketResult = await supportTicketsCollection.insertOne(ticket);
-  // Opening note comes from the system, not the reporter — it deliberately
+  // Opening note comes from the system, not the reporter (it deliberately)
   // does NOT set firstRespondedAt, since a human still has to actually
   // respond for that SLA clock to stop.
   await supportTicketMessagesCollection.insertOne({
@@ -379,14 +351,11 @@ async function logSafetyIncident({ ride, type, triggeredBy, location, note }) {
   return { incidentId: incidentResult.insertedId, ticketId: ticketResult.insertedId };
 }
 
-// Lazy, batched — no job scheduler here either. Runs only against
-// in_progress rides in whatever batch was just read, using ONE query for
-// all their drivers' last-known-location timestamps rather than one per
-// ride. A driver's app going quiet past OFF_APP_WARNING_MS decorates the
-// ride so the rider's screen can show a soft warning; past
-// OFF_APP_INCIDENT_MS it escalates to a real logged incident + ticket
-// (only once per ride — offAppIncidentLogged guards against re-firing on
-// every poll).
+// Runs only against in_progress rides in the current batch, one query for
+// all their drivers' last-known-location timestamps. Past OFF_APP_WARNING_MS
+// of silence, decorates the ride with a soft warning; past
+// OFF_APP_INCIDENT_MS it logs a real incident + ticket (once per ride, 
+// offAppIncidentLogged guards against re-firing on every poll).
 async function decorateOffAppRisk(rides) {
   const activeDriverIds = [...new Set(
     rides.filter((r) => r.status === "in_progress" && r.driverId).map((r) => r.driverId.toString())
@@ -415,7 +384,7 @@ async function decorateOffAppRisk(rides) {
         type: "off_app_suspected",
         triggeredBy: "system",
         location: driver?.location || null,
-        note: `No driver location update for ${Math.round(silenceMs / 60000)} minutes during an active trip — possible off-app continuation.`,
+        note: `No driver location update for ${Math.round(silenceMs / 60000)} minutes during an active trip, possible off-app continuation.`,
       });
       await ridesCollection.updateOne({ _id: ride._id }, { $set: { offAppIncidentLogged: true } });
       decorated.offAppIncidentLogged = true;
@@ -425,15 +394,11 @@ async function decorateOffAppRisk(rides) {
 }
 
 // ---------- Rider rating & appeals ----------
-// Mirrors the driver-rating logic that already existed, in the other
-// direction, plus a deactivation path that was entirely missing. Nobody
-// gets deactivated off one bad ride: it takes a real sample size AND a
-// meaningfully low average, and even then it's a 7-day WARNING
-// (pending_deactivation), not an instant cutoff — the rider can keep
-// riding, see the warning, and either improve or appeal before it becomes
-// final. Recovering above threshold during that window cancels the
-// warning automatically, same self-correcting spirit as the rest of this
-// backend (auto-waived cancellation fees, auto-escalating matches).
+// A rider isn't deactivated off one bad ride: it takes a minimum sample
+// size and a meaningfully low average, and even then it's a 7-day warning
+// (pending_deactivation) rather than an instant cutoff (the rider can keep)
+// riding and either recover above threshold (which cancels the warning
+// automatically) or appeal before it becomes final.
 const RIDER_DEACTIVATION_MIN_RATINGS = 5;
 const RIDER_DEACTIVATION_THRESHOLD = 3.5;
 const DEACTIVATION_APPEAL_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days to appeal before it's final
@@ -462,7 +427,7 @@ async function recalculateRiderRating(riderEmail) {
   await usersCollection.updateOne({ email: riderEmail }, { $set: update });
 }
 
-// Lazy — finalizes a pending deactivation once its 7-day window has
+// Lazy, finalizes a pending deactivation once its 7-day window has
 // passed, UNLESS an appeal is currently open against it (an unresolved
 // appeal ticket pauses the clock, so it can never run out from under a
 // rider who's actively being reviewed).
@@ -479,11 +444,11 @@ async function resolveRiderDeactivation(user) {
   return { ...user, accountStatus: "deactivated" };
 }
 
-// Gate used by ride/package request creation — deactivated riders can't
+// Gate used by ride/package request creation. Deactivated riders can't
 // book new trips (they can still log in and see why, and file an appeal).
 async function assertRiderNotDeactivated(riderEmail) {
   let riderUser = await usersCollection.findOne({ email: riderEmail, role: "rider" });
-  if (!riderUser) return; // no rider account under this email — nothing to gate
+  if (!riderUser) return; // no rider account under this email. Nothing to gate
   riderUser = await resolveRiderDeactivation(riderUser);
   if (riderUser.accountStatus === "deactivated") {
     throw badRequest("Your account has been deactivated due to low ratings. File an appeal from your Account screen to request a review.");
@@ -491,35 +456,28 @@ async function assertRiderNotDeactivated(riderEmail) {
 }
 
 // ---------- Fault-based cancellation fees ----------
-// Trust feature: a rider should never be charged for a driver's no-show.
-// CANCELLATION_FEE_NAIRA is a starting default — easy to tune or make
-// category-dependent later. NO_SHOW_RADIUS_METERS is how close a driver
-// must be to the pickup point for a rider-initiated cancellation to count
-// as "the driver was there" (fee applies) vs "the driver never showed"
-// (fee auto-waived, no support ticket needed).
+// A rider should never be charged for a driver's no-show. NO_SHOW_RADIUS_METERS
+// is how close a driver must be to the pickup point for a rider-initiated
+// cancellation to count as "the driver was there" (fee applies) vs "the
+// driver never showed" (fee auto-waived, no ticket needed).
 const CANCELLATION_FEE_NAIRA = 500;
 const NO_SHOW_RADIUS_METERS = 100;
 
 // ---------- Destination-change consent gate ----------
 // A driver can propose a new destination mid-trip, but it never takes
-// effect silently — the rider must explicitly approve it first. If the
+// effect silently. The rider must explicitly approve it first. If the
 // rider doesn't respond in time, the change auto-fails safe: the ORIGINAL
 // destination stays in effect, never the driver's proposed one.
-const DESTINATION_CHANGE_TIMEOUT_MS = 30 * 1000; // 30s — a short, real window
+const DESTINATION_CHANGE_TIMEOUT_MS = 30 * 1000; // 30s. A short, real window
 
 // ---------- Support SLA tracker ----------
-// Every ticket gets two clocks the moment it's created — a first-response
-// deadline and a resolution deadline — set from its priority. There's no
-// job scheduler in this stack (same constraint as the destination-change
-// timeout above), so "breached" isn't a flag written by a cron job; it's
-// computed live, on read, by comparing now() to the stored deadlines. That
-// means the admin dashboard is never stale, and it costs nothing extra.
-//
-// Safety reports always get "urgent" no matter what category/priority the
-// client sends — a rider/driver should never be able to (accidentally or
-// otherwise) talk a safety report down to a slower queue.
+// Every ticket gets a first-response and a resolution deadline set from
+// its priority. "Breached" isn't a stored flag. It's computed live on
+// read by comparing now() to the deadlines, so the admin dashboard is
+// never stale. Safety reports are always "urgent" regardless of what
+// category/priority the client sends.
 const SLA_POLICY_MINUTES = {
-  urgent: { firstResponse: 5, resolution: 120 },       // 5 min / 2 hrs — safety-adjacent
+  urgent: { firstResponse: 5, resolution: 120 },       // 5 min / 2 hrs (safety-adjacent)
   high: { firstResponse: 30, resolution: 24 * 60 },    // 30 min / 24 hrs
   normal: { firstResponse: 4 * 60, resolution: 72 * 60 }, // 4 hrs / 72 hrs
 };
@@ -545,7 +503,7 @@ function slaDeadlines(priority, createdAt) {
   };
 }
 
-// Attaches live SLA status to a ticket doc — never persisted, always
+// Attaches live SLA status to a ticket doc (never persisted, always)
 // recomputed against the current time. "Breached" only applies to clocks
 // that are still running (an already-resolved ticket can't newly breach);
 // "met" is the permanent record of whether each clock was hit, used for
@@ -560,7 +518,7 @@ function decorateTicketWithSla(ticket) {
   return { ...ticket, firstResponseBreached, resolutionBreached, firstResponseMet, resolutionMet };
 }
 
-// Haversine distance in METERS — separate from the km version in the mobile
+// Haversine distance in METERS. Separate from the km version in the mobile
 // app's fare.js since this runs in a different runtime with no shared code.
 function distanceMetersBetween(a, b) {
   if (!a || !b || typeof a.lat !== "number" || typeof b.lat !== "number") return null;
@@ -604,7 +562,7 @@ async function connectToDatabase() {
   safetyIncidentsCollection = db.collection("safetyIncidents");
   driverOnlineSessionsCollection = db.collection("driverOnlineSessions");
 
-  // Keep signups unique and lookups fast. safe to run every boot — no-ops if they already exist.
+  // Keep signups unique and lookups fast. safe to run every boot (no-ops if they already exist).
   await usersCollection.createIndex({ email: 1 }, { unique: true });
   await driversCollection.createIndex({ email: 1 }, { unique: true });
   await ridesCollection.createIndex({ driverId: 1, createdAt: -1 });
@@ -640,10 +598,8 @@ function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
-// Guards every `new ObjectId(someParam)` call — previously a malformed id in
-// the URL (e.g. a typo, or someone poking the API) threw synchronously
-// inside an async function and the request would just hang with no
-// response. Now it's a clean 400.
+// Validates the id before constructing an ObjectId, so a malformed id in
+// the URL returns a clean 400 instead of a thrown error with no response.
 function toObjectId(id, label = "id") {
   if (!ObjectId.isValid(id)) {
     const err = new Error(`Invalid ${label}`);
@@ -660,7 +616,7 @@ function badRequest(message) {
 }
 
 // If a driver's proposed destination change has sat unanswered past
-// DESTINATION_CHANGE_TIMEOUT_MS, resolve it now as "expired" — the original
+// DESTINATION_CHANGE_TIMEOUT_MS, resolve it now as "expired". The original
 // destination silently wins, never the driver's proposed one. There's no
 // job scheduler in this stack, so this runs lazily any time a ride is read
 // (both apps poll every few seconds, so nothing waits long in practice).
@@ -685,7 +641,7 @@ async function resolveExpiredDestinationChanges(rides) {
 // Combined lazy-resolution pass for a ride read: expire any stale
 // destination-change request, then check whether the current match
 // candidate has gone quiet past MATCH_RESPONSE_TIMEOUT_MS and needs to be
-// escalated. Order doesn't matter functionally (disjoint fields) — this
+// escalated. Order doesn't matter functionally (disjoint fields) (this)
 // just saves every read call site from having to know about both.
 async function resolveRideState(ride) {
   const afterDestination = await resolveExpiredDestinationChange(ride);
@@ -704,7 +660,7 @@ app.get("/", (req, res) => {
   res.send("Spring backend is running!");
 });
 
-// Public — the mobile app fetches this once at startup so fare pricing
+// Public (the mobile app fetches this once at startup so fare pricing)
 // only ever needs to be edited on the backend (see FARE_CONFIG above).
 app.get("/api/config/fare", (req, res) => {
   res.json(FARE_CONFIG);
@@ -718,7 +674,7 @@ app.post("/api/signup", asyncRoute(async (req, res) => {
     throw badRequest("name, email, password and role are required");
   }
   // Admin accounts can't be self-service-created by just picking "admin" as
-  // a role — that would defeat the whole point of gating the admin routes.
+  // a role, that would defeat the whole point of gating the admin routes.
   // You create the first admin by signing up with role "admin" AND the
   // ADMIN_SIGNUP_KEY from your .env in the adminKey field (e.g. via a curl
   // request or Postman, not a public-facing screen). Rotate/remove that key
@@ -758,7 +714,7 @@ app.post("/api/signup", asyncRoute(async (req, res) => {
   const result = await usersCollection.insertOne(newUser);
 
   // Every rider (and driver) gets a Spring Wallet the moment they sign up,
-  // starting at ₦0 — this is what backs the Payments → Spring Wallet screen.
+  // starting at ₦0 (this is what backs the Payments → Spring Wallet screen).
   await walletsCollection.insertOne({ email: normalizedEmail, balance: 0, createdAt: new Date() });
 
   // If signing up as a driver, also create their driver profile
@@ -770,7 +726,7 @@ app.post("/api/signup", asyncRoute(async (req, res) => {
       email: normalizedEmail,
       car: car?.trim() || "Unknown vehicle",
       plate: plate?.trim() || "N/A",
-      vehicleType: vehicleType || "economy", // economy | comfort | xl | green — which rider category this driver serves
+      vehicleType: vehicleType || "economy", // economy | comfort | xl | green, which rider category this driver serves
       rating: 5.0,
       online: false,
       location: null, // { lat, lng }
@@ -879,7 +835,7 @@ app.post("/api/driver/status", asyncRoute(async (req, res) => {
   }
 
   // Going offline mid-match shouldn't leave a rider silently waiting out
-  // the full MATCH_RESPONSE_TIMEOUT_MS on a driver who just logged off —
+  // the full MATCH_RESPONSE_TIMEOUT_MS on a driver who just logged off, 
   // escalate any ride currently pinged to them right away instead.
   if (online === false) {
     const strandedRides = await ridesCollection
@@ -928,7 +884,7 @@ app.post("/api/rides/request", asyncRoute(async (req, res) => {
   const rideCategory = category || "economy";
   const rideePickupLocation = pickupLocation && typeof pickupLocation.lat === "number" ? pickupLocation : null;
   // The rest of the same-category online fleet, nearest-first, minus the
-  // driver the rider actually picked — this is the fallback list decline/
+  // driver the rider actually picked, this is the fallback list decline/
   // timeout walks through automatically. Built once, up front, so the
   // locked price never has a reason to be re-quoted mid-search.
   const matchQueue = await buildMatchQueue(rideCategory, driver._id, rideePickupLocation);
@@ -940,7 +896,7 @@ app.post("/api/rides/request", asyncRoute(async (req, res) => {
     driverName: driver.name,
     pickup: pickup.trim(),
     destination: destination.trim(),
-    // Coordinates alongside the display strings above — needed for
+    // Coordinates alongside the display strings above (needed for)
     // fault-based cancellation fees (was the driver actually near pickup?)
     // and for route-deviation checks later. Optional so older clients
     // that haven't sent them yet don't 400.
@@ -982,7 +938,7 @@ app.get("/api/rides/rider/:riderEmail", asyncRoute(async (req, res) => {
   res.json(await resolveRideStates(rides));
 }));
 
-// Single ride lookup — used for polling a specific trip (e.g. a driver
+// Single ride lookup, used for polling a specific trip (e.g. a driver
 // waiting to hear back on a destination-change request) without pulling
 // the rider's/driver's whole ride history.
 app.get("/api/rides/:id", asyncRoute(async (req, res) => {
@@ -992,7 +948,7 @@ app.get("/api/rides/:id", asyncRoute(async (req, res) => {
 }));
 
 // Driver accepts a ride request. Requires the accepting driverId to match
-// whoever the ride is CURRENTLY pinged to — without this, a driver whose
+// whoever the ride is CURRENTLY pinged to. Without this, a driver whose
 // stale app still shows an old "Accept" button (after they declined, timed
 // out, or the rider's request already moved on) could hijack a ride that
 // isn't theirs anymore.
@@ -1009,7 +965,7 @@ app.post("/api/rides/:id/accept", asyncRoute(async (req, res) => {
   res.json({ message: "Ride accepted" });
 }));
 
-// Driver declines a ride request — automatically escalates to the next
+// Driver declines a ride request. Automatically escalates to the next
 // nearest driver in the match queue instead of just dying (see
 // advanceMatchQueue above). Same stale-app guard as accept.
 app.post("/api/rides/:id/decline", asyncRoute(async (req, res) => {
@@ -1023,23 +979,16 @@ app.post("/api/rides/:id/decline", asyncRoute(async (req, res) => {
 
   const updated = await advanceMatchQueue(ride, "declined");
   const message = updated.status === "unmatched"
-    ? "Ride declined — no more nearby drivers to offer it to"
-    : "Ride declined — automatically offered to the next nearest driver";
+    ? "Ride declined. No more nearby drivers to offer it to"
+    : "Ride declined, automatically offered to the next nearest driver";
   res.json({ message, status: updated.status, matchStatus: updated.matchStatus });
 }));
 
 // Either party marks the trip in progress / completed.
-//
-// in_progress: kicks off route-deviation protection by asking Google
-// Routes for the optimal pickup->destination route and storing its
-// distance — nothing to compare actual distance against later without it.
-//
-// completed: the client (driver app, which tracks the live GPS distance)
-// passes distanceKm + fare so the final price is saved on the ride.
-// applyRouteDeviationProtection compares the driven distance against the
-// optimal route captured at trip start; only a genuine deviation swaps in
-// a capped fare and flags the ride — otherwise the submitted fare is
-// billed exactly as before.
+// in_progress: fetches Google Routes' optimal pickup->destination distance
+// to compare against later. completed: the client passes distanceKm + fare;
+// applyRouteDeviationProtection compares driven vs. optimal distance and
+// only swaps in a capped fare if there's a genuine deviation.
 app.post("/api/rides/:id/status", asyncRoute(async (req, res) => {
   const { status, distanceKm, fare } = req.body; // "in_progress" | "completed"
   if (!["in_progress", "completed"].includes(status)) {
@@ -1080,27 +1029,19 @@ app.post("/api/rides/:id/status", asyncRoute(async (req, res) => {
   const response = { message: `Ride marked as ${status}` };
   if (flaggedForReview) {
     response.routeDeviationFlagged = true;
-    response.note = "Trip distance came in well above the optimal route — fare was capped for the rider and flagged for review.";
+    response.note = "Trip distance came in well above the optimal route, so the fare was capped for the rider and flagged for review.";
   }
   res.json(response);
 }));
 
 // Cancel a ride/package before it's underway, with fault-based fee logic:
-//
-//  - Cancelling before any driver has accepted ("requested") never incurs a
-//    fee — nothing was promised yet.
-//  - Cancelling after a driver accepted DOES risk a fee, but ONLY if the
-//    driver was actually near the pickup point (within NO_SHOW_RADIUS_METERS)
-//    at the moment of cancellation. If the driver's last known location is
-//    farther than that (or missing entirely), the fee is auto-waived — no
-//    support ticket needed, no back-and-forth. This is the whole point:
-//    riders should never be charged for a driver's no-show.
-//  - A driver-initiated cancellation never charges the rider a fee.
-//
-// Every cancellation — fee or no fee — is written to `cancellations` as a
-// timestamped audit record (both parties' GPS, computed distance, and the
-// reasoning) so a dispute can be resolved by looking at data instead of
-// he-said-she-said.
+//  - Before any driver accepts ("requested"), cancelling is always free.
+//  - After acceptance, a fee only applies if the driver was actually near
+//    the pickup point (within NO_SHOW_RADIUS_METERS) at cancellation time, 
+//    otherwise it's auto-waived, no support ticket needed.
+//  - A driver-initiated cancellation never charges the rider.
+// Every cancellation is written to `cancellations` as a timestamped audit
+// record (both parties' GPS, computed distance, reasoning) for disputes.
 app.post("/api/rides/:id/cancel", asyncRoute(async (req, res) => {
   const { cancelledBy, location } = req.body; // cancelledBy: "rider" | "driver"; location: canceller's own current { lat, lng }
   if (!["rider", "driver"].includes(cancelledBy)) {
@@ -1134,16 +1075,16 @@ app.post("/api/rides/:id/cancel", asyncRoute(async (req, res) => {
   let feeCharged = false;
   let reason;
   if (cancelledBy === "driver") {
-    reason = "Driver-initiated cancellation — riders are never charged when the driver cancels.";
+    reason = "Driver-initiated cancellation. Riders are never charged when the driver cancels.";
   } else if (ride.status === "requested") {
-    reason = "No driver had accepted yet — nothing to charge for.";
+    reason = "No driver had accepted yet, so there's nothing to charge for.";
   } else if (distanceMeters == null) {
-    reason = "Driver's location wasn't available to verify — fee auto-waived in the rider's favor.";
+    reason = "Driver's location wasn't available to verify, so the fee was auto-waived in the rider's favor.";
   } else if (distanceMeters <= NO_SHOW_RADIUS_METERS) {
     feeCharged = true;
     reason = `Driver was already at the pickup point (${Math.round(distanceMeters)}m away) when you cancelled.`;
   } else {
-    reason = `Driver was still ${Math.round(distanceMeters)}m from the pickup point — this looked like a no-show, so the fee was automatically waived.`;
+    reason = `Driver was still ${Math.round(distanceMeters)}m from the pickup point. This looked like a no-show, so the fee was automatically waived.`;
   }
 
   const feeAmount = feeCharged ? CANCELLATION_FEE_NAIRA : 0;
@@ -1155,7 +1096,7 @@ app.post("/api/rides/:id/cancel", asyncRoute(async (req, res) => {
   );
 
   if (feeCharged) {
-    // Debit the rider (in-house wallet ledger — can go negative, same as
+    // Debit the rider (in-house wallet ledger, can go negative, same as
     // any other simple ledger; there's no card auto-charge wired up yet).
     await walletsCollection.updateOne(
       { email: ride.riderEmail },
@@ -1166,7 +1107,7 @@ app.post("/api/rides/:id/cancel", asyncRoute(async (req, res) => {
       email: ride.riderEmail,
       type: "cancellation_fee",
       amount: -feeAmount,
-      note: `Cancellation fee — driver was at the pickup point (ride ${rideId})`,
+      note: `Cancellation fee: driver was at the pickup point (ride ${rideId})`,
       rideId,
       createdAt: now,
     });
@@ -1183,7 +1124,7 @@ app.post("/api/rides/:id/cancel", asyncRoute(async (req, res) => {
           email: driver.email,
           type: "cancellation_compensation",
           amount: feeAmount,
-          note: `No-show compensation — rider cancelled after you reached pickup (ride ${rideId})`,
+          note: `No-show compensation: rider cancelled after you reached pickup (ride ${rideId})`,
           rideId,
           createdAt: now,
         });
@@ -1208,7 +1149,7 @@ app.post("/api/rides/:id/cancel", asyncRoute(async (req, res) => {
 }));
 
 // Driver proposes a new destination mid-trip. This does NOT change the
-// ride's destination yet — it only stores a pending proposal and starts the
+// ride's destination yet, it only stores a pending proposal and starts the
 // clock. The rider must explicitly approve via /destination-change/respond
 // before anything changes; if the window lapses, resolveExpiredDestinationChange
 // (run lazily whenever the ride is next read) fails it safe to the original
@@ -1254,7 +1195,7 @@ app.post("/api/rides/:id/destination-change/request", asyncRoute(async (req, res
     resolvedAt: null,
   });
 
-  res.json({ message: "Destination change proposed — waiting on rider approval", pendingDestinationChange: pending });
+  res.json({ message: "Destination change proposed, waiting on rider approval", pendingDestinationChange: pending });
 }));
 
 // Rider approves or rejects a pending destination change.
@@ -1271,7 +1212,7 @@ app.post("/api/rides/:id/destination-change/respond", asyncRoute(async (req, res
     return res.status(409).json({ error: "No destination change is waiting on a response" });
   }
   if (new Date() >= new Date(pending.expiresAt)) {
-    // Already timed out — let the lazy-expiry path handle it consistently.
+    // Already timed out, let the lazy-expiry path handle it consistently.
     await resolveExpiredDestinationChange(ride);
     return res.status(409).json({ error: "This destination change request has expired" });
   }
@@ -1282,7 +1223,7 @@ app.post("/api/rides/:id/destination-change/respond", asyncRoute(async (req, res
     update.destination = pending.newDestination;
     update.destinationLocation = pending.newDestinationLocation;
     // The optimal route calculated at trip start was for the OLD
-    // destination — comparing actual distance against it after a genuine
+    // destination. Comparing actual distance against it after a genuine
     // destination change would unfairly flag the driver. Recompute against
     // the new endpoint (fails open, same as the trip-start call, so this
     // never blocks the approval itself).
@@ -1307,7 +1248,7 @@ app.post("/api/rides/:id/destination-change/respond", asyncRoute(async (req, res
 
 // Either party hits SOS mid-trip (or shortly after drop-off). Logs a
 // permanent incident and immediately opens an urgent, SLA-tracked support
-// ticket — see logSafetyIncident above for why that's the whole alerting
+// ticket. See logSafetyIncident above for why that's the whole alerting
 // mechanism here (no separate push/SMS system exists).
 app.post("/api/rides/:id/sos", asyncRoute(async (req, res) => {
   const { triggeredBy, location } = req.body; // "rider" | "driver"
@@ -1341,10 +1282,10 @@ app.post("/api/rides/:id/sos", asyncRoute(async (req, res) => {
     { $set: { sos: { triggeredBy, at: new Date(), location: location || null, incidentId } } }
   );
 
-  res.json({ message: "SOS received — this has been flagged for urgent review", incidentId, ticketId });
+  res.json({ message: "SOS received. This has been flagged for urgent review", incidentId, ticketId });
 }));
 
-// Generates (or returns the existing) shareable trip link — a rider can
+// Generates (or returns the existing) shareable trip link, a rider can
 // send this to someone outside the app to track the trip live, no login
 // required on their end.
 app.post("/api/rides/:id/share", asyncRoute(async (req, res) => {
@@ -1358,7 +1299,7 @@ app.post("/api/rides/:id/share", asyncRoute(async (req, res) => {
   res.json({ shareToken });
 }));
 
-// Public, unauthenticated — the whole point is someone without the app can
+// Public, unauthenticated. The whole point is someone without the app can
 // open this. Returns ONLY a safety-relevant subset: never rider/driver
 // email or phone, never the fare, live location only while the trip is
 // actually under way.
@@ -1393,7 +1334,7 @@ app.get("/api/share/:token", asyncRoute(async (req, res) => {
 }));
 
 // Set/replace the caller's emergency contacts (used by SOS follow-up and
-// shown on the rider/driver Safety screen). Full replace, capped at 3 —
+// shown on the rider/driver Safety screen). Full replace, capped at 3, 
 // simpler and safer than incremental add/remove for a list this short.
 app.put("/api/profile/emergency-contacts", asyncRoute(async (req, res) => {
   const { email, contacts } = req.body;
@@ -1477,7 +1418,7 @@ app.get("/api/rides/:id/messages", asyncRoute(async (req, res) => {
 }));
 
 // One row per ride/package that ever reached a chat-capable stage (a driver
-// was actually matched), each with a preview of its most recent message —
+// was actually matched), each with a preview of its most recent message, 
 // this is what backs the Communication → Messages inbox screen.
 app.get("/api/inbox/:role/:id", asyncRoute(async (req, res) => {
   const { role, id } = req.params;
@@ -1513,7 +1454,7 @@ app.get("/api/inbox/:role/:id", asyncRoute(async (req, res) => {
 
 // ---------- REVIEWS ----------
 
-// Rider AND driver each leave a review after a completed ride — this now
+// Rider AND driver each leave a review after a completed ride. This now
 // genuinely flows both ways. One review per (ride, fromRole): a second
 // attempt is rejected rather than silently averaged in again.
 app.post("/api/rides/:id/review", asyncRoute(async (req, res) => {
@@ -1547,7 +1488,7 @@ app.post("/api/rides/:id/review", asyncRoute(async (req, res) => {
 
   // Rider rated the driver -> recalculate the driver's average (unchanged
   // from before). Driver rated the rider -> recalculate the RIDER's
-  // average, which is the new half — see recalculateRiderRating above for
+  // average, which is the new half, see recalculateRiderRating above for
   // the deactivation-warning logic that rides on top of this.
   if (fromRole === "rider" && ride.driverId) {
     const driverReviews = await reviewsCollection.find({ driverId: ride.driverId, fromRole: "rider" }).toArray();
@@ -1579,8 +1520,8 @@ app.get("/api/rider/:email/reviews", asyncRoute(async (req, res) => {
   res.json(reviews);
 }));
 
-// Rider-facing: their own rating + account standing — what a Safety/Account
-// screen shows ("your rating is 3.2 — your account is under review").
+// Rider-facing: their own rating + account standing, what a Safety/Account
+// screen shows ("your rating is 3.2 (your account is under review")).
 // Runs the lazy deactivation resolver first so this is always current.
 app.get("/api/riders/:email/status", asyncRoute(async (req, res) => {
   const normalizedEmail = req.params.email.trim().toLowerCase();
@@ -1600,10 +1541,10 @@ app.get("/api/riders/:email/status", asyncRoute(async (req, res) => {
 }));
 
 // Rider files an appeal against a deactivation warning/decision. Reuses
-// the support ticket system built for #5 as the audit trail and review
-// channel — "high" priority (real, but not a safety emergency), tied back
-// to the account via appealTicketId so the 7-day clock in
-// resolveRiderDeactivation pauses while it's open.
+// the support ticket system as the audit trail and review channel, 
+// "high" priority (real, but not a safety emergency), tied back to the
+// account via appealTicketId so the 7-day clock in resolveRiderDeactivation
+// pauses while it's open.
 app.post("/api/riders/:email/appeal", asyncRoute(async (req, res) => {
   const { message } = req.body;
   if (!message?.trim()) throw badRequest("message is required");
@@ -1659,7 +1600,7 @@ app.post("/api/riders/:email/appeal", asyncRoute(async (req, res) => {
     { $set: { appealTicketId: ticketResult.insertedId, appealFiledAt: now } }
   );
 
-  res.json({ message: "Appeal submitted — we'll review your account", ticketId: ticketResult.insertedId });
+  res.json({ message: "Appeal submitted, we'll review your account", ticketId: ticketResult.insertedId });
 }));
 
 // Admin: the binding decision on a rider's appeal. Reinstating clears the
@@ -1691,16 +1632,16 @@ app.post("/api/admin/riders/:email/appeal-decision", requireAdmin, asyncRoute(as
       ticketId: user.appealTicketId,
       senderRole: "agent",
       senderName: "Spring Support",
-      text: note?.trim() || (decision === "reinstate" ? "Appeal approved — account reinstated." : "Appeal reviewed — deactivation upheld."),
+      text: note?.trim() || (decision === "reinstate" ? "Appeal approved, account reinstated." : "Appeal reviewed, deactivation upheld."),
       createdAt: now,
     });
   }
 
-  res.json({ message: decision === "reinstate" ? "Appeal approved — account reinstated" : "Appeal denied — deactivation upheld" });
+  res.json({ message: decision === "reinstate" ? "Appeal approved, account reinstated" : "Appeal denied, deactivation upheld" });
 }));
 
 // Driver-facing earnings dashboard. Everything here is computed from real
-// ride records — nothing is a placeholder number. "Today" = since local
+// ride records. Nothing is a placeholder number. "Today" = since local
 // midnight on the server; if your driver base spans multiple time zones,
 // swap this for a per-driver timezone later.
 app.get("/api/driver/:id/summary", asyncRoute(async (req, res) => {
@@ -1731,7 +1672,7 @@ app.get("/api/driver/:id/summary", asyncRoute(async (req, res) => {
   const acceptanceRate = answered.length ? Math.round((accepted.length / answered.length) * 100) : 100;
 
   // Online-time pay: guaranteed-minimum model. A driver's day is never
-  // worth less than (online hours × rate) — trip earnings only get a
+  // worth less than (online hours × rate) (trip earnings only get a)
   // top-up when they fall short of that floor, never a flat add-on on top
   // of a day that already cleared it. onlineTimePayToday is kept as an
   // alias of the new onlineTimeTopUpToday field so any older client still
@@ -1761,17 +1702,13 @@ app.get("/api/driver/:id/summary", asyncRoute(async (req, res) => {
 }));
 
 // ---------- SUPPORT SLA TRACKER ----------
-// A rider or driver opens a ticket (optionally tied to a specific ride —
+// A rider or driver opens a ticket (optionally tied to a specific ride, 
 // e.g. disputing a cancellation fee), it gets a priority + two SLA
 // deadlines at creation, and every read decorates it with live
 // firstResponseBreached/resolutionBreached flags (see decorateTicketWithSla
 // above) instead of relying on a background job to flip a stored flag.
-// There's no auth/token layer anywhere else in this backend (login doesn't
-// UPDATE: the admin routes below now require a valid admin JWT
-// (requireAdmin, defined near the top of this file) — they used to trust
-// the request body like everything else, but that's fixed now. The
-// rider/driver-facing routes above and below still trust body.email;
-// migrating those is the next hardening step, tracked separately.
+// The admin routes below require a valid admin JWT (requireAdmin); the
+// rider/driver-facing routes still trust body.email.
 
 // Rider or driver opens a new ticket.
 app.post("/api/support/tickets", asyncRoute(async (req, res) => {
@@ -1851,7 +1788,7 @@ app.get("/api/support/tickets/:id", asyncRoute(async (req, res) => {
   res.json({ ticket: decorateTicketWithSla(ticket), messages });
 }));
 
-// Reply on a ticket thread — rider/driver (the reporter) or an agent.
+// Reply on a ticket thread (rider/driver (the reporter) or an agent).
 // An agent's FIRST reply is what stops the first-response SLA clock and
 // bumps a brand-new ticket into "in_progress". If the original reporter
 // writes back on a ticket already marked "resolved", that's a signal it
@@ -1868,7 +1805,7 @@ app.post("/api/support/tickets/:id/messages", asyncRoute(async (req, res) => {
   const ticket = await supportTicketsCollection.findOne({ _id: ticketId });
   if (!ticket) return res.status(404).json({ error: "Ticket not found" });
   if (ticket.status === "closed") {
-    throw badRequest("This ticket is closed — open a new one instead of replying here");
+    throw badRequest("This ticket is closed. Open a new one instead of replying here");
   }
 
   const now = new Date();
@@ -1928,7 +1865,7 @@ app.post("/api/support/tickets/:id/status", asyncRoute(async (req, res) => {
 }));
 
 // Admin: triage queue across every ticket, optionally filtered. Sorted
-// breached-first, then by priority, then oldest-first — the order a real
+// breached-first, then by priority, then oldest-first. The order a real
 // support queue should be worked in.
 app.get("/api/admin/support/tickets", requireAdmin, asyncRoute(async (req, res) => {
   const { status, priority, category, breachedOnly } = req.query;
@@ -1964,7 +1901,7 @@ app.get("/api/admin/support/tickets", requireAdmin, asyncRoute(async (req, res) 
   res.json(decorated);
 }));
 
-// Admin: SLA compliance dashboard — current breach counts plus historical
+// Admin: SLA compliance dashboard, current breach counts plus historical
 // hit-rate and average-time stats, computed from real ticket records only.
 app.get("/api/admin/support/summary", requireAdmin, asyncRoute(async (req, res) => {
   const tickets = (await supportTicketsCollection.find({}).toArray()).map(decorateTicketWithSla);
@@ -2009,23 +1946,15 @@ app.get("/api/admin/support/summary", requireAdmin, asyncRoute(async (req, res) 
 }));
 
 // ---------- PLACES (server-side proxy for Google Places) ----------
-// The mobile app used to call Google's Places Web Service directly with the
-// same key given to the Android Maps SDK. That key is (correctly)
-// restricted to the Android app's package name + SHA-1 fingerprint, which
-// Google can verify for native SDK calls but NOT for a plain HTTPS request
-// coming from JS — so those requests were silently failing with
-// REQUEST_DENIED and the app just showed no results. Proxying through here
-// lets us use a separate, server-side key instead.
-//
-// This uses Places API (NEW) — the legacy Places endpoints
-// (maps/api/place/...) are unavailable on newly created Google Cloud
-// projects, so New is the only reliable option going forward. Make sure
-// "Places API (New)" (NOT "Places API") is enabled for GOOGLE_PLACES_API_KEY
-// in Google Cloud Console → APIs & Services → Library.
+// Proxied through the backend with a separate server-side key, since the
+// Android Maps SDK key (restricted to the app's package name + SHA-1
+// fingerprint) can't be verified for plain HTTPS requests from JS.
+// Uses Places API (New). Enable "Places API (New)" (not "Places API")
+// for GOOGLE_PLACES_API_KEY in Google Cloud Console → APIs & Services → Library.
 const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const PLACES_BIAS_LAT = 5.49; // South-East Nigeria, Spring's operating area
 const PLACES_BIAS_LNG = 7.20;
-const PLACES_BIAS_RADIUS = 50000.0; // meters — Google's max allowed for locationBias.circle
+const PLACES_BIAS_RADIUS = 50000.0; // meters (Google's max allowed for locationBias.circle)
 
 app.get("/api/places/autocomplete", asyncRoute(async (req, res) => {
   if (!PLACES_KEY) return res.status(500).json({ error: "GOOGLE_PLACES_API_KEY is not configured on the server" });
@@ -2115,7 +2044,7 @@ app.get("/api/places/nearby", asyncRoute(async (req, res) => {
 // ---------- SPRING WALLET ----------
 // A simple in-house balance + ledger. There's no real payment processor
 // wired in yet, so "Top up" here is a manual/simulated credit (clearly
-// labeled as such to the rider) rather than a real card charge — swap the
+// labeled as such to the rider) rather than a real card charge, swap the
 // topup handler for a real payment gateway webhook when Spring adds one.
 
 app.get("/api/wallet/:email", asyncRoute(async (req, res) => {
@@ -2147,7 +2076,7 @@ app.post("/api/wallet/:email/topup", asyncRoute(async (req, res) => {
     email: normalizedEmail,
     type: "topup",
     amount: Math.round(amount),
-    note: "Wallet top-up (simulated — no real payment gateway connected yet)",
+    note: "Wallet top-up (simulated, no real payment gateway connected yet)",
     createdAt: new Date(),
   };
   await walletTransactionsCollection.insertOne(tx);
@@ -2157,7 +2086,7 @@ app.post("/api/wallet/:email/topup", asyncRoute(async (req, res) => {
 
 // ---------- SPRING SEND (package / waybill delivery) ----------
 // Reuses the ridesCollection so the whole accept/decline/status/chat
-// pipeline built for rides works unchanged for packages — a package is
+// pipeline built for rides works unchanged for packages (a package is)
 // just a ride with type: "package" plus a few package-only fields.
 
 app.post("/api/packages/request", asyncRoute(async (req, res) => {
@@ -2211,7 +2140,7 @@ app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// Centralized error handler — every asyncRoute()-wrapped handler above ends
+// Centralized error handler (every asyncRoute()-wrapped handler above ends)
 // up here on failure, so callers always get clean JSON instead of a raw
 // stack trace or a hung connection.
 app.use((err, req, res, next) => {
