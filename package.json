@@ -3,12 +3,12 @@
   "version": "2.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node api.js && node server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "Spring backend — auth, drivers, rides",
+  "description": "Spring backend \u2014 auth, drivers, rides",
   "dependencies": {
     "bcrypt": "^5.1.1",
     "cors": "^2.8.6",
