@@ -615,7 +615,83 @@ function badRequest(message) {
   return err;
 }
 
-// If a driver's proposed destination change has sat unanswered past
+// ---------- TOTP (RFC 6238) two-factor authentication ----------
+// Hand-rolled with Node's built-in crypto so 2FA doesn't need a new
+// dependency, and works with any standard authenticator app (Google
+// Authenticator, Authy, 1Password, etc.) since it follows the same spec
+// they all implement.
+const TOTP_STEP_SECONDS = 30;
+const TOTP_DIGITS = 6;
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Encode(buffer) {
+  let bits = 0, value = 0, output = "";
+  for (const byte of buffer) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  return output;
+}
+
+function base32Decode(str) {
+  const clean = str.toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = 0, value = 0;
+  const bytes = [];
+  for (const char of clean) {
+    const idx = BASE32_ALPHABET.indexOf(char);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function generateTotpSecret() {
+  return base32Encode(crypto.randomBytes(20)); // 160-bit secret, the standard size
+}
+
+function totpAt(secretBase32, timeStepCounter) {
+  const key = base32Decode(secretBase32);
+  const counterBuffer = Buffer.alloc(8);
+  counterBuffer.writeBigUInt64BE(BigInt(timeStepCounter));
+  const hmac = crypto.createHmac("sha1", key).update(counterBuffer).digest();
+  const offset = hmac[hmac.length - 1] & 0xf;
+  const binCode =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  return String(binCode % 10 ** TOTP_DIGITS).padStart(TOTP_DIGITS, "0");
+}
+
+// Accepts the current 30s window and one window either side, so a code
+// doesn't fail just because the user's clock (or ours) is a few seconds
+// off, or they were a little slow typing it in.
+function verifyTotp(secretBase32, code) {
+  if (!secretBase32 || !code) return false;
+  const counter = Math.floor(Date.now() / 1000 / TOTP_STEP_SECONDS);
+  for (let errorWindow = -1; errorWindow <= 1; errorWindow++) {
+    if (totpAt(secretBase32, counter + errorWindow) === String(code).trim()) return true;
+  }
+  return false;
+}
+
+function totpAuthUrl(secretBase32, email) {
+  const label = encodeURIComponent(`Spring:${email}`);
+  const issuer = encodeURIComponent("Spring");
+  return `otpauth://totp/${label}?secret=${secretBase32}&issuer=${issuer}&digits=${TOTP_DIGITS}&period=${TOTP_STEP_SECONDS}`;
+}
+
+
 // DESTINATION_CHANGE_TIMEOUT_MS, resolve it now as "expired". The original
 // destination silently wins, never the driver's proposed one. There's no
 // job scheduler in this stack, so this runs lazily any time a ride is read
@@ -747,10 +823,25 @@ app.post("/api/login", asyncRoute(async (req, res) => {
   if (!user) {
     return res.status(401).json({ error: "Invalid email or password" });
   }
+  if (user.accountStatus === "deleted") {
+    return res.status(401).json({ error: "This account has been deleted." });
+  }
 
   const passwordMatches = await bcrypt.compare(password, user.password);
   if (!passwordMatches) {
     return res.status(401).json({ error: "Invalid email or password" });
+  }
+
+  // Password checks out, but if this account has 2FA turned on, don't hand
+  // over a real session token yet — issue a short-lived challenge token
+  // that's only good for completing the 2FA step at /api/login/2fa-verify.
+  if (user.twoFactorEnabled) {
+    const challengeToken = jwt.sign(
+      { purpose: "2fa-challenge", userId: String(user._id), email: user.email },
+      JWT_SECRET,
+      { expiresIn: "5m" }
+    );
+    return res.json({ requires2FA: true, challengeToken });
   }
 
   let driverId;
@@ -765,6 +856,47 @@ app.post("/api/login", asyncRoute(async (req, res) => {
   await walletsCollection.updateOne(
     { email: normalizedEmail },
     { $setOnInsert: { email: normalizedEmail, balance: 0, createdAt: new Date() } },
+    { upsert: true }
+  );
+
+  const token = signToken(user);
+  res.json({ message: "Login successful!", token, name: user.name, email: user.email, phone: user.phone || null, role: user.role, driverId, vehicleType });
+}));
+
+// Second step of login when the account has 2FA enabled: exchange the
+// short-lived challenge token + a 6-digit code for a real session token.
+app.post("/api/login/2fa-verify", asyncRoute(async (req, res) => {
+  const { challengeToken, code } = req.body;
+  if (!challengeToken || !code) throw badRequest("challengeToken and code are required");
+
+  let claims;
+  try {
+    claims = jwt.verify(challengeToken, JWT_SECRET);
+  } catch (e) {
+    return res.status(401).json({ error: "This login attempt has expired. Please log in again." });
+  }
+  if (claims.purpose !== "2fa-challenge") {
+    return res.status(401).json({ error: "Invalid challenge token" });
+  }
+
+  const user = await usersCollection.findOne({ email: claims.email });
+  if (!user || !user.twoFactorEnabled) {
+    return res.status(401).json({ error: "Two-factor authentication is no longer enabled on this account" });
+  }
+  if (!verifyTotp(user.twoFactorSecret, code)) {
+    return res.status(401).json({ error: "That code is incorrect or has expired" });
+  }
+
+  let driverId;
+  let vehicleType;
+  if (user.role === "driver") {
+    const driverProfile = await driversCollection.findOne({ email: user.email });
+    driverId = driverProfile?._id;
+    vehicleType = driverProfile?.vehicleType;
+  }
+  await walletsCollection.updateOne(
+    { email: user.email },
+    { $setOnInsert: { email: user.email, balance: 0, createdAt: new Date() } },
     { upsert: true }
   );
 
@@ -793,6 +925,142 @@ app.patch("/api/profile", asyncRoute(async (req, res) => {
     await driversCollection.updateOne({ email: normalizedEmail }, { $set: { name: update.name } });
   }
   res.json({ message: "Profile updated", name: result.name, phone: result.phone || null });
+}));
+
+// ---------- ACCOUNT: password, 2FA, export, deletion ----------
+// All of these require a valid session token (not just a trusted email in
+// the body) since they're irreversible or security-sensitive.
+
+app.post("/api/account/change-password", requireAuth, asyncRoute(async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) throw badRequest("currentPassword and newPassword are required");
+  if (newPassword.length < 6) throw badRequest("newPassword must be at least 6 characters");
+
+  const user = await usersCollection.findOne({ email: req.user.email });
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const matches = await bcrypt.compare(currentPassword, user.password);
+  if (!matches) return res.status(401).json({ error: "Current password is incorrect" });
+
+  const hashed = await bcrypt.hash(newPassword, 10);
+  await usersCollection.updateOne({ _id: user._id }, { $set: { password: hashed } });
+  res.json({ message: "Password changed" });
+}));
+
+// Start 2FA setup: generate (but don't yet activate) a TOTP secret. The
+// user must prove they actually saved it, by submitting a valid code to
+// /2fa/enable, before it takes effect — otherwise a typo or a dropped
+// screen could lock someone out of their own account.
+app.post("/api/account/2fa/setup", requireAuth, asyncRoute(async (req, res) => {
+  const user = await usersCollection.findOne({ email: req.user.email });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.twoFactorEnabled) throw badRequest("Two-factor authentication is already enabled");
+
+  const secret = generateTotpSecret();
+  await usersCollection.updateOne({ _id: user._id }, { $set: { pendingTwoFactorSecret: secret } });
+  res.json({ secret, otpauthUrl: totpAuthUrl(secret, user.email) });
+}));
+
+app.post("/api/account/2fa/enable", requireAuth, asyncRoute(async (req, res) => {
+  const { code } = req.body;
+  if (!code) throw badRequest("code is required");
+  const user = await usersCollection.findOne({ email: req.user.email });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (!user.pendingTwoFactorSecret) throw badRequest("Start setup first with /api/account/2fa/setup");
+
+  if (!verifyTotp(user.pendingTwoFactorSecret, code)) {
+    return res.status(401).json({ error: "That code is incorrect or has expired" });
+  }
+  await usersCollection.updateOne(
+    { _id: user._id },
+    { $set: { twoFactorEnabled: true, twoFactorSecret: user.pendingTwoFactorSecret }, $unset: { pendingTwoFactorSecret: "" } }
+  );
+  res.json({ enabled: true });
+}));
+
+app.post("/api/account/2fa/disable", requireAuth, asyncRoute(async (req, res) => {
+  const { code } = req.body;
+  if (!code) throw badRequest("code is required");
+  const user = await usersCollection.findOne({ email: req.user.email });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (!user.twoFactorEnabled) throw badRequest("Two-factor authentication is not enabled");
+
+  if (!verifyTotp(user.twoFactorSecret, code)) {
+    return res.status(401).json({ error: "That code is incorrect or has expired" });
+  }
+  await usersCollection.updateOne(
+    { _id: user._id },
+    { $set: { twoFactorEnabled: false }, $unset: { twoFactorSecret: "", pendingTwoFactorSecret: "" } }
+  );
+  res.json({ enabled: false });
+}));
+
+app.get("/api/account/2fa/status", requireAuth, asyncRoute(async (req, res) => {
+  const user = await usersCollection.findOne({ email: req.user.email });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  res.json({ enabled: !!user.twoFactorEnabled });
+}));
+
+// Everything Spring has on this account, as one JSON payload, so "Download
+// my data" actually produces something instead of just filing a ticket.
+app.get("/api/account/export", requireAuth, asyncRoute(async (req, res) => {
+  const email = req.user.email;
+  const user = await usersCollection.findOne({ email }, { projection: { password: 0, twoFactorSecret: 0, pendingTwoFactorSecret: 0 } });
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const [driverProfile, ridesAsRider, ridesAsDriver, reviewsGiven, reviewsReceived, wallet, walletTransactions, supportTickets] = await Promise.all([
+    user.role === "driver" ? driversCollection.findOne({ email }) : Promise.resolve(null),
+    ridesCollection.find({ riderEmail: email }).toArray(),
+    user.role === "driver" ? (async () => {
+      const driver = await driversCollection.findOne({ email });
+      return driver ? ridesCollection.find({ driverId: driver._id }).toArray() : [];
+    })() : Promise.resolve([]),
+    reviewsCollection.find({ raterEmail: email }).toArray(),
+    reviewsCollection.find({ targetEmail: email }).toArray(),
+    walletsCollection.findOne({ email }),
+    walletTransactionsCollection.find({ email }).toArray(),
+    supportTicketsCollection.find({ raisedByEmail: email }).toArray(),
+  ]);
+
+  res.json({
+    exportedAt: new Date(),
+    profile: user,
+    driverProfile: driverProfile || undefined,
+    ridesAsRider,
+    ridesAsDriver: user.role === "driver" ? ridesAsDriver : undefined,
+    reviewsGiven,
+    reviewsReceived,
+    wallet: wallet || undefined,
+    walletTransactions,
+    supportTickets,
+  });
+}));
+
+// Soft delete: we scrub personal info and make the password unusable
+// rather than hard-deleting the row, because rides/reviews/tickets the
+// other party can see still reference this email. The account can never
+// log in again after this.
+app.post("/api/account/delete", requireAuth, asyncRoute(async (req, res) => {
+  const { password } = req.body;
+  if (!password) throw badRequest("password is required to confirm deletion");
+  const user = await usersCollection.findOne({ email: req.user.email });
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const matches = await bcrypt.compare(password, user.password);
+  if (!matches) return res.status(401).json({ error: "Password is incorrect" });
+
+  const unusablePassword = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 10);
+  await usersCollection.updateOne(
+    { _id: user._id },
+    {
+      $set: { name: "Deleted user", phone: null, password: unusablePassword, accountStatus: "deleted", deletedAt: new Date() },
+      $unset: { twoFactorSecret: "", pendingTwoFactorSecret: "", twoFactorEnabled: "" },
+    }
+  );
+  if (user.role === "driver") {
+    await driversCollection.updateOne({ email: user.email }, { $set: { name: "Deleted user", online: false } });
+  }
+  res.json({ message: "Account deleted" });
 }));
 
 // ---------- DRIVERS ----------
