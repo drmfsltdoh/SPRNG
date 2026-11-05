@@ -3,7 +3,7 @@
   "version": "2.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node api.js && node server.js"
+    "start": "node init && node server.js"
   },
   "keywords": [],
   "author": "",
