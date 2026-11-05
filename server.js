@@ -12,7 +12,6 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Mongo URI comes from .env (never hardcode credentials in code).
 const uri = process.env.MONGODB_URI;
 if (!uri) {
   console.error("Missing MONGODB_URI in .env. Copy .env.example to .env and fill it in.");
@@ -21,10 +20,7 @@ if (!uri) {
 const client = new MongoClient(uri);
 
 // ---------- Auth (JWT) ----------
-// signup/login issue a JWT; requireAuth/requireAdmin verify it on protected
-// routes. Note: admin routes fully require a valid admin token, but most
-// rider/driver routes still trust req.body.email directly. Migrating
-// those to token auth too is the next hardening step.
+
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
   console.error("Missing JWT_SECRET in .env. Copy .env.example to .env and fill it in.");
@@ -95,10 +91,7 @@ function calculateFareForCategory(distanceKm, categoryId) {
 }
 
 // ---------- Locked-price matching queue ----------
-// If the picked driver doesn't answer, the backend builds a fallback queue
-// of next-nearest same-category drivers and walks through it on decline or
-// timeout. The fare is locked once estimatedFare is first stored, escalating
-// through the queue only ever changes who's asked, never re-quotes the price.
+.
 const MATCH_RESPONSE_TIMEOUT_MS = 20 * 1000; // 20s to accept/decline before auto-escalating
 const MATCH_QUEUE_MAX_CANDIDATES = 5; // cap how many drivers get pinged per ride
 
