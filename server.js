@@ -335,7 +335,7 @@ async function logSafetyIncident({ ride, type, triggeredBy, location, note }) {
     senderName: "Spring Safety System",
     text: description,
     createdAt: now,
-  });
+  });   
   await safetyIncidentsCollection.updateOne(
     { _id: incidentResult.insertedId },
     { $set: { supportTicketId: ticketResult.insertedId } }
